@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Verify you are human</title>
+<style>body{font:16px system-ui;margin:3rem;max-width:480px;text-align:center}
+#hold{margin:2rem auto;padding:1.4rem 2rem;font-size:18px;border:2px solid #555;
+  border-radius:10px;background:#f3f3f3;user-select:none;cursor:pointer;display:inline-block}
+#status{margin-top:1rem;font-weight:600}
+.ok{color:#2a7}.bad{color:#c33}</style></head>
+<body>
+<h1>Press &amp; Hold to confirm you are human</h1>
+<div id="hold" role="button">Press &amp; Hold</div>
+<div id="status">Not verified.</div>
+<script>
+// Mimics a real "press and hold for N seconds" anti-bot gate:
+// the button must stay pressed (no release) for HOLD_MS, and the events
+// must be trusted (isTrusted). Releasing early resets.
+const HOLD_MS = 3000;
+const btn = document.getElementById('hold');
+const status = document.getElementById('status');
+let timer = null, holding = false;
+
+function start(e) {
+  if (!e.isTrusted) { status.textContent = 'Synthetic event rejected.'; return; }
+  holding = true;
+  btn.style.background = '#cfe';
+  status.textContent = 'Hold…';
+  status.className = '';
+  timer = setTimeout(() => {
+    if (holding) {
+      status.textContent = 'Verified! Human confirmed.';
+      status.className = 'ok';
+      document.title = 'Verified';
+      btn.textContent = '✓ Verified';
+    }
+  }, HOLD_MS);
+}
+function end() {
+  holding = false;
+  if (document.title !== 'Verified') {
+    clearTimeout(timer);
+    status.textContent = 'Released too early — hold longer.';
+    status.className = 'bad';
+    btn.style.background = '#f3f3f3';
+  }
+}
+btn.addEventListener('mousedown', start);
+window.addEventListener('mouseup', end);
+</script>
+</body></html>

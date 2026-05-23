@@ -1,0 +1,317 @@
+diff --git a/run_eval.py b/run_eval.py
+index 104ed4c..789c633 100644
+--- a/run_eval.py
++++ b/run_eval.py
+@@ -12,10 +12,14 @@ Available browsers: browser-use-cloud (default), anchor, browserbase,
+ """
+ 
+ # Fix for MacOS users using uv without SSL certificate setup
+-import certifi, os
++import certifi, os, sys
+ 
+ os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+ 
++browser_new_source = os.getenv("BROWSER_NEW_SOURCE")
++if browser_new_source and browser_new_source not in sys.path:
++    sys.path.insert(0, browser_new_source)
++
+ import logging
+ 
+ os.environ["BROWSER_USE_SETUP_LOGGING"] = (
+@@ -32,16 +36,19 @@ from datetime import datetime
+ from pathlib import Path
+ from cryptography.fernet import Fernet
+ from dotenv import load_dotenv
+-from browser_use import Agent, Browser, ChatGoogle
++from browser_use import Agent, Browser, BrowserProfile, ChatGoogle
+ from browser_use.llm import ChatBrowserUse
+ from browsers import PROVIDERS, get_provider
+ from judge import construct_judge_messages, JudgementResult
+ 
+ load_dotenv()
+ 
+-# Judge LLM - always use gemini-2.5-flash for consistent judging across all evaluations
+-JUDGE_LLM = ChatGoogle(model="gemini-2.5-flash", api_key=os.getenv("GOOGLE_API_KEY"))
+-TASKS_FILE = Path(__file__).parent / "BU_Bench_V1.enc"
++# Judge LLM - defaults to gemini-2.5-flash for consistent judging across all evaluations
++JUDGE_LLM = None
++TASK_FILES = {
++    "bu": (Path(__file__).parent / "BU_Bench_V1.enc", b"BU_Bench_V1"),
++    "stealth": (Path(__file__).parent / "Stealth_Bench_V1.enc", b"Stealth_Bench_V1"),
++}
+ MAX_CONCURRENT = 3
+ TASK_TIMEOUT = 1800  # 30 minutes max per task
+ 
+@@ -60,12 +67,45 @@ def encode_screenshots(paths: list[str]) -> list[str]:
+     return result
+ 
+ 
+-def load_tasks() -> list[dict]:
+-    key = base64.urlsafe_b64encode(hashlib.sha256(b"BU_Bench_V1").digest())
+-    encrypted = base64.b64decode(TASKS_FILE.read_text())
++def load_tasks(suite: str = "bu") -> list[dict]:
++    task_file, key_name = TASK_FILES[suite]
++    key = base64.urlsafe_b64encode(hashlib.sha256(key_name).digest())
++    encrypted = base64.b64decode(task_file.read_text())
+     return json.loads(Fernet(key).decrypt(encrypted))
+ 
+ 
++def create_llm(model_name: str):
++    if model_name.startswith("ollama:"):
++        from browser_use import ChatOllama
++
++        return ChatOllama(
++            model=model_name.split(":", 1)[1],
++            host=os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434"),
++            timeout=float(os.getenv("OLLAMA_TIMEOUT", "180")),
++            ollama_options={
++                "temperature": float(os.getenv("OLLAMA_TEMPERATURE", "0")),
++                "num_ctx": int(os.getenv("OLLAMA_NUM_CTX", "262144")),
++            },
++        )
++    if model_name.startswith("openai:"):
++        # OpenAI-compatible endpoint; default base_url points at the local
++        # codex-oai-proxy so we drive the bench with OpenAI's Codex via the
++        # user's ChatGPT OAuth login (no API key needed).
++        from browser_use import ChatOpenAI
++
++        return ChatOpenAI(
++            model=model_name.split(":", 1)[1],
++            base_url=os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:8787/v1"),
++            api_key=os.getenv("OPENAI_API_KEY", "sk-codex-proxy-no-key-needed"),
++            timeout=float(os.getenv("OPENAI_TIMEOUT", "300")),
++        )
++    if model_name == "bu-2-0":
++        return ChatBrowserUse(model="bu-2-0")
++    raise ValueError(
++        f"Unsupported model: {model_name}. Use bu-2-0, ollama:<name>, or openai:<name>."
++    )
++
++
+ async def create_browser(browser_provider) -> Browser:
+     """Create a Browser instance from a provider module.
+ 
+@@ -77,7 +117,15 @@ async def create_browser(browser_provider) -> Browser:
+         return Browser(use_cloud=True, cloud_timeout=30)
+     cdp_url = await browser_provider.connect()
+     if cdp_url is None:
+-        return Browser(headless=getattr(browser_provider, "HEADLESS", True))
++        # Each (possibly parallel) task gets its OWN fresh profile dir. Sharing
++        # browser-use's default profile across parallel tasks causes a
++        # SingletonLock collision so Chromium never opens its CDP port and the
++        # task hangs. A unique user_data_dir per browser avoids that.
++        import tempfile
++        return Browser(
++            headless=getattr(browser_provider, "HEADLESS", True),
++            user_data_dir=tempfile.mkdtemp(prefix="gb-bench-"),
++        )
+     return Browser(cdp_url=cdp_url)
+ 
+ 
+@@ -87,6 +135,7 @@ async def run_task(
+     browser_provider=None,
+     llm=None,
+     run_data_dir: Path = None,
++    no_judge: bool = False,
+ ) -> dict:
+     """Run a single task. Returns result dict with score (0 on failure).
+ 
+@@ -104,11 +153,31 @@ async def run_task(
+ 
+             # To swap model: replace ChatBrowserUse() with your LLM (e.g. ChatOpenAI, ChatAnthropic)
+             # You can use any OpenAI API compatible model by changing base_url. You can use ollama too. See https://docs.browser-use.com/supported-models for info
+-            agent = Agent(
++            # GB_TOOLS=1 injects Ghost-brow's press_and_hold action plus an
++            # automatic press-and-hold gate solver (runs each step), to test
++            # whether they recover the press-and-hold (PerimeterX) failures.
++            agent_kwargs = dict(
+                 task=task["confirmed_task"],
+                 llm=llm or ChatBrowserUse(model="bu-2-0"),
+                 browser=browser,
+             )
++            if os.getenv("GB_TOOLS") == "1":
++                from ghost_actions import build_tools
++                from gate_solver import solve_press_hold
++
++                agent_kwargs["tools"] = build_tools()
++
++                async def _auto_solve(_state=None, _out=None, _n=None, _b=browser):
++                    try:
++                        acted = await solve_press_hold(_b, seconds=4.0)
++                        if acted:
++                            print(f"[gb] auto-solved press-hold gate: {acted!r}")
++                    except Exception as e:
++                        print(f"[gb] gate solver error: {type(e).__name__}: {e}")
++
++                agent_kwargs["register_new_step_callback"] = _auto_solve
++
++            agent = Agent(**agent_kwargs)
+ 
+             try:
+                 agent_history = await asyncio.wait_for(
+@@ -128,6 +197,12 @@ async def run_task(
+                     "error": f"Task timed out after {TASK_TIMEOUT}s",
+                 }
+ 
++            # Close the browser window on the success path too (the original
++            # only stopped it on timeout, so headful windows piled up).
++            try:
++                await browser.stop()
++            except Exception:
++                pass
+             if browser_provider:
+                 await browser_provider.disconnect()
+ 
+@@ -147,23 +222,29 @@ async def run_task(
+                 [p for p in agent_history.screenshot_paths() if p is not None]
+             )
+ 
+-            # Run judge
+-            judge_messages = construct_judge_messages(
+-                task=agent_task,
+-                final_result=final_result,
+-                agent_steps=agent_steps,
+-                ground_truth=ground_truth,
+-                screenshots_b64=screenshots_b64,
+-            )
+-            response = await JUDGE_LLM.ainvoke(
+-                judge_messages, output_format=JudgementResult
+-            )
+-            judgement: JudgementResult = response.completion
++            if no_judge:
++                judgement = None
++                score = 1 if final_result and final_result != "Agent did not return a result" else 0
++                print(f"Task {task_id} completed without judge: provisional_score={score}")
++            else:
++                if JUDGE_LLM is None:
++                    raise RuntimeError("GOOGLE_API_KEY is required unless --no-judge is set")
++                judge_messages = construct_judge_messages(
++                    task=agent_task,
++                    final_result=final_result,
++                    agent_steps=agent_steps,
++                    ground_truth=ground_truth,
++                    screenshots_b64=screenshots_b64,
++                )
++                response = await JUDGE_LLM.ainvoke(
++                    judge_messages, output_format=JudgementResult
++                )
++                judgement = response.completion
+ 
+-            score = 1 if judgement.verdict else 0
+-            print(
+-                f"Task {task_id} completed: score={score}, verdict={judgement.verdict}"
+-            )
++                score = 1 if judgement.verdict else 0
++                print(
++                    f"Task {task_id} completed: score={score}, verdict={judgement.verdict}"
++                )
+ 
+             # Save trace to run_data/
+             run_data_dir.mkdir(parents=True, exist_ok=True)
+@@ -180,7 +261,7 @@ async def run_task(
+                     {
+                         "agent_trace": trace,
+                         "metrics": metrics,
+-                        "judgement": judgement.model_dump(),
++                        "judgement": judgement.model_dump() if judgement else None,
+                     },
+                     indent=2,
+                 )
+@@ -192,7 +273,7 @@ async def run_task(
+                 "steps": steps,
+                 "duration": duration,
+                 "cost": cost,
+-                "judgement": judgement.model_dump(),
++                "judgement": judgement.model_dump() if judgement else None,
+             }
+ 
+         except Exception as e:
+@@ -211,7 +292,14 @@ async def run_task(
+ 
+ 
+ async def main():
+-    parser = argparse.ArgumentParser(description="Run BU_Bench_V1 evaluation")
++    global JUDGE_LLM, MODEL_NAME, MAX_CONCURRENT, TASK_TIMEOUT
++    parser = argparse.ArgumentParser(description="Run browser-use benchmark evaluation")
++    parser.add_argument(
++        "--suite",
++        default="bu",
++        choices=["bu", "stealth"],
++        help="Task suite to run: bu or stealth",
++    )
+     parser.add_argument(
+         "--browser",
+         default="browser-use-cloud",
+@@ -224,7 +312,34 @@ async def main():
+         default=None,
+         help="Number of tasks to run (default: all)",
+     )
++    parser.add_argument(
++        "--model",
++        default="bu-2-0",
++        help="Agent model: bu-2-0 or ollama:<model-name>",
++    )
++    parser.add_argument(
++        "--parallel",
++        type=int,
++        default=MAX_CONCURRENT,
++        help="Max concurrent tasks",
++    )
++    parser.add_argument(
++        "--task-timeout",
++        type=int,
++        default=TASK_TIMEOUT,
++        help="Per-task timeout in seconds",
++    )
++    parser.add_argument(
++        "--no-judge",
++        action="store_true",
++        help="Skip judge LLM. Useful for smoke testing setup without GOOGLE_API_KEY.",
++    )
+     args = parser.parse_args()
++    MODEL_NAME = args.model
++    MAX_CONCURRENT = args.parallel
++    TASK_TIMEOUT = args.task_timeout
++    if not args.no_judge:
++        JUDGE_LLM = ChatGoogle(model="gemini-2.5-flash", api_key=os.getenv("GOOGLE_API_KEY"))
+ 
+     # Resolve browser provider (None = use native browser-use-cloud path)
+     browser_name = args.browser
+@@ -235,20 +350,33 @@ async def main():
+ 
+     # Build run key and paths
+     run_start = datetime.now().strftime("%Y%m%d_%H%M%S")
+-    run_key = f"{AGENT_FRAMEWORK_NAME}_{AGENT_FRAMEWORK_VERSION}_browser_{browser_name}_model_{MODEL_NAME}"
++    run_key = f"{args.suite.upper()}_{AGENT_FRAMEWORK_NAME}_{AGENT_FRAMEWORK_VERSION}_browser_{browser_name}_model_{MODEL_NAME.replace(':', '_')}"
+     run_data_dir = (
+         Path(__file__).parent / "run_data" / f"{run_key}_start_at_{run_start}"
+     )
+     results_file = Path(__file__).parent / "results" / f"{run_key}.json"
+ 
+-    tasks = load_tasks()
+-    if args.tasks:
++    tasks = load_tasks(args.suite)
++    # GB_TASK_IDS lets us target specific task_ids (e.g. the PerimeterX press-hold
++    # set) instead of just the first N.
++    gb_ids = os.getenv("GB_TASK_IDS")
++    if gb_ids:
++        wanted = {s.strip() for s in gb_ids.split(",") if s.strip()}
++        tasks = [t for t in tasks if str(t.get("task_id")) in wanted]
++        print(f"[gb] filtered to task_ids {sorted(wanted)} -> {len(tasks)} tasks")
++    if args.tasks is not None:
+         tasks = tasks[: args.tasks]
+     sem = asyncio.Semaphore(MAX_CONCURRENT)
++    llm = create_llm(args.model)
+     results = await asyncio.gather(
+         *[
+             run_task(
+-                t, sem, browser_provider=browser_provider, run_data_dir=run_data_dir
++                t,
++                sem,
++                browser_provider=browser_provider,
++                llm=llm,
++                run_data_dir=run_data_dir,
++                no_judge=args.no_judge,
+             )
+             for t in tasks
+         ]

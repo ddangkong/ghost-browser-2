@@ -1,0 +1,52 @@
+# Cache
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Environments
+.venv*/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Build
+dist/
+
+# Data
+*.gif
+*.txt
+*.pdf
+*.csv
+*.json
+*.jsonl
+*.log
+*.bak
+*.bak_*
+
+# Exception: keep benchmark results
+!benchmark_results.json
+
+# Secrets
+.env
+secrets.env
+browser_cookies.json
+credentials.json
+token.json
+
+# Runtime
+logs/
+results.md
+.browser-profile/
+temp-profile-*
+saved_trajectories/
+
+# System prompt backups
+browser_use/agent/system_prompts/backups/
+
+# Claude
+.claude/
+CLAUDE.local.md
