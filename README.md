@@ -161,9 +161,36 @@ Both should print `RESULT: title='Verified' => PASS`.
 
 ---
 
+## Built on / borrowed from
+
+This release stands on a handful of open-source pieces. Below is what was
+actually pulled in and how — credit and licenses included.
+
+### Directly merged / vendored into this repo
+
+| Source | Role here | License |
+|---|---|---|
+| **[`ddangkong/ghost-browser` (v1)](https://github.com/ddangkong/ghost-browser)** | The v1 harness — `local_worker.py`'s reflexion-retry loop, guard layer, auto-recovery, partial-result saving. v2 keeps the spirit and adds the missing capability (`press_and_hold`) plus the OpenAI/Codex backend. `benchmark_results.json` is carried over for direct v1↔v2 comparison. | MIT |
+| **[`browser-use/browser-use` v0.12.6](https://github.com/browser-use/browser-use)** | The underlying agent framework. v2 keeps it vendored exactly as v1 did, and extends it via the `Tools` registry (`ghost_actions.py`) and `register_new_step_callback` hook (`gate_solver.py`) — no fork, no patch. Also exposed a **mouse-coordinate bug in `browser_use/actor/mouse.py`** (`Mouse.down()/up()` hardcode `x=0,y=0`) that v2 routes around by dispatching CDP `Input.dispatchMouseEvent` ourselves. | Apache 2.0 |
+
+### External tools v2 plugs into (used but not vendored)
+
+| Source | How v2 uses it |
+|---|---|
+| **[`browser-use/browser-use-benchmarks`](https://github.com/browser-use/browser-use-benchmarks)** (the Stealth Bench V1 harness) | The official test suite. v2 ships a small patch — [`stealth_bench_patch/run_eval.patch`](stealth_bench_patch/run_eval.patch) — that adds the OpenAI-compatible backend, the `GB_TOOLS` injection point, the gate-solver step hook, a per-task fresh profile, and `browser.stop()` on the success path. Apply on top of the upstream repo. |
+| **[`openai/codex`](https://github.com/openai/codex)** (Codex CLI) | The agent's brain. v2 calls `codex exec` either through `codex-oai-proxy` (default, OpenAI-compatible) or directly via [`codex_client.py`](codex_client.py)'s subprocess wrapper. Uses your ChatGPT Plus/Pro OAuth login — no API key. |
+| **[`codex-oai-proxy`](https://github.com/ddangkong/codex-oai-proxy)** | Exposes Codex CLI as an OpenAI-compatible HTTP endpoint. v2's `run_eval.py` patch points `ChatOpenAI(base_url=…)` at it. Without the proxy, fall back to `codex_client.py`. |
+
+### Considered but NOT merged
+
+| Source | Why it's listed | Status |
+|---|---|---|
+| **[`CloakHQ/CloakBrowser`](https://github.com/CloakHQ/CloakBrowser)** | We benchmarked v2 against it and reviewed the architecture. CloakBrowser operates at a **lower layer** (58 C++ source-level patches to the Chromium binary covering canvas/WebGL/audio/fonts/WebRTC/automation signals); v2 operates at the **action/agent layer above the browser**. They're complementary, not competing — pointing browser-use's `executable_path` at the CloakBrowser binary would stack the two cleanly. Not done in this release; documented as a future integration path. | Future |
+
 ## License
 
-MIT. Built on `browser-use` (Apache 2.0), `OpenAI Codex CLI`, and Chromium.
+MIT for this repo. See the table above for the upstream licenses of each
+component v2 builds on.
 
 ---
 
